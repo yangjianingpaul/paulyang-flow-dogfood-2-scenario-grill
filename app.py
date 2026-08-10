@@ -6,6 +6,7 @@
 import json
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 PORT = 8000
 
@@ -114,7 +115,16 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler naming
-        self._send_json(404, {"error": f"no route for GET {self.path}"})
+        # 该端点不定义查询参数，查询串一律忽略 (TC17)。
+        path = urlsplit(self.path).path
+        if path == "/loans":
+            self._handle_list_loans()
+        else:
+            self._send_json(404, {"error": f"no route for GET {self.path}"})
+
+    def _handle_list_loans(self):
+        """GET /loans → 200 Loan 数组，含已归还的，顺序不作规定 (TC6, TC8, TC17, TC18)。"""
+        self._send_json(200, list_loans())
 
     def _handle_create_book(self):
         """POST /books → 201 {"id", "title"} (TC3, TC8)."""
@@ -171,7 +181,7 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return payload
 
-    def _send_json(self, status: int, body: dict):
+    def _send_json(self, status: int, body: dict | list):
         raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
