@@ -1,0 +1,18 @@
+name: verify
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Run project verify command
+        run: |
+          CMD=$(sed -n 's/^verify: *//p' flow.yml | head -1)
+          test -n "$CMD" || { echo "flow.yml: missing verify key"; exit 1; }
+          echo "verify: $CMD"
+          eval "$CMD"
