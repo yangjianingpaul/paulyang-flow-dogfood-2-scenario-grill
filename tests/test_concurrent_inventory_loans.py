@@ -5,6 +5,7 @@ import json
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -28,8 +29,9 @@ def _wait_until_serving(process, port):
     url = f"http://127.0.0.1:{port}/nope"
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            output = process.stdout.read()
-            raise AssertionError(f"app.py exited during startup: {output}")
+            raise AssertionError(
+                f"app.py exited during startup with code {process.returncode}"
+            )
         try:
             urllib.request.urlopen(url, timeout=0.2)
         except urllib.error.HTTPError:
@@ -45,29 +47,31 @@ def two_process_urls():
     app.reset_state()
     root = Path(app.__file__).resolve().parent
     ports = (_unused_port(), _unused_port())
-    processes = [
-        subprocess.Popen(
-            [sys.executable, "app.py", "--port", str(port)],
-            cwd=root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        for port in ports
-    ]
-    try:
-        for process, port in zip(processes, ports):
-            _wait_until_serving(process, port)
-        yield tuple(f"http://127.0.0.1:{port}" for port in ports)
-    finally:
-        for process in processes:
-            process.terminate()
-        for process in processes:
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=5)
+    with tempfile.TemporaryFile(mode="w+") as server_errors:
+        processes = [
+            subprocess.Popen(
+                [sys.executable, "app.py", "--port", str(port)],
+                cwd=root,
+                stdout=subprocess.DEVNULL,
+                stderr=server_errors,
+                text=True,
+            )
+            for port in ports
+        ]
+        try:
+            for process, port in zip(processes, ports):
+                _wait_until_serving(process, port)
+            urls = tuple(f"http://127.0.0.1:{port}" for port in ports)
+            yield urls, server_errors
+        finally:
+            for process in processes:
+                process.terminate()
+            for process in processes:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
 
 
 def _borrow(base_url, book_id, client_no, start):
@@ -125,7 +129,7 @@ def test_two_processes_atomically_share_inventory_for_1000_clients(
     two_process_urls, http
 ):
     """#9/S2, TC3/TC4/TC6: exactly 500 of 1000 cross-process borrows win."""
-    first_url, second_url = two_process_urls
+    (first_url, second_url), server_errors = two_process_urls
     status, _, book = http(
         "POST",
         f"{first_url}/books",
@@ -152,9 +156,20 @@ def test_two_processes_atomically_share_inventory_for_1000_clients(
     destinations = Counter(url for _, url, _, _ in results)
     successes = [body for kind, _, _, body in results if kind == "success"]
     failures = [body for kind, _, _, body in results if kind == "failure"]
+    transport_errors = [
+        (url, body)
+        for kind, url, _, body in results
+        if kind == "transport_error"
+    ]
+    server_errors.flush()
+    server_errors.seek(0)
+    server_error_output = server_errors.read()
 
     assert destinations == {first_url: 500, second_url: 500}
-    assert counts == {"success": 500, "failure": 500}
+    assert counts == {"success": 500, "failure": 500}, (
+        transport_errors,
+        server_error_output,
+    )
     assert all(status == 201 for kind, _, status, _ in results if kind == "success")
     assert all(status == 409 for kind, _, status, _ in results if kind == "failure")
     assert all(
