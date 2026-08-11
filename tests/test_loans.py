@@ -12,7 +12,9 @@ ISO_UTC_Z = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z")
 @pytest.fixture
 def book(base_url, http):
     """#1/S1 作为 setup：先建一本书拿 id (DEC3, TC13)。"""
-    _, _, body = http("POST", f"{base_url}/books", {"title": "三体"})
+    _, _, body = http(
+        "POST", f"{base_url}/books", {"title": "三体", "initial_stock": 1}
+    )
     return body
 
 
@@ -36,7 +38,9 @@ def test_loan_id_shape_is_ln_n_on_its_own_counter(base_url, http, book):
     _, _, first = http(
         "POST", f"{base_url}/loans", {"book_id": book["id"], "borrower": "paul"}
     )
-    _, _, other_book = http("POST", f"{base_url}/books", {"title": "球状闪电"})
+    _, _, other_book = http(
+        "POST", f"{base_url}/books", {"title": "球状闪电", "initial_stock": 1}
+    )
     _, _, second = http(
         "POST", f"{base_url}/loans", {"book_id": other_book["id"], "borrower": "alice"}
     )
@@ -117,7 +121,9 @@ def test_returning_an_unknown_loan_is_404(base_url, http):
 
 def test_borrow_again_after_return_succeeds_with_a_new_loan_id(base_url, http):
     """#1/S5: 归还后再借成功，返回新的 loan id 且不等于 <LOAN_1> (TC14, TC16)。"""
-    _, _, book = http("POST", f"{base_url}/books", {"title": "三体"})
+    _, _, book = http(
+        "POST", f"{base_url}/books", {"title": "三体", "initial_stock": 1}
+    )
     _, _, loan_1 = http(
         "POST", f"{base_url}/loans", {"book_id": book["id"], "borrower": "paul"}
     )
@@ -137,7 +143,9 @@ def test_returned_loan_is_kept_and_its_id_never_rewritten(base_url, http):
     """TC14: 已归还的 Loan 记录不被删除，其 id 不被改写。"""
     import app
 
-    _, _, book = http("POST", f"{base_url}/books", {"title": "三体"})
+    _, _, book = http(
+        "POST", f"{base_url}/books", {"title": "三体", "initial_stock": 1}
+    )
     _, _, loan_1 = http(
         "POST", f"{base_url}/loans", {"book_id": book["id"], "borrower": "paul"}
     )
@@ -155,7 +163,9 @@ def test_at_most_one_unreturned_loan_per_book_across_a_full_cycle(base_url, http
     """TC12: 对任一 book_id，任何时刻至多存在一条 returned_at 为 null 的 Loan。"""
     import app
 
-    _, _, book = http("POST", f"{base_url}/books", {"title": "三体"})
+    _, _, book = http(
+        "POST", f"{base_url}/books", {"title": "三体", "initial_stock": 1}
+    )
 
     def open_loans():
         return [
@@ -183,8 +193,12 @@ def test_at_most_one_unreturned_loan_per_book_across_a_full_cycle(base_url, http
 
 def test_other_books_are_unaffected_by_a_conflicting_book(base_url, http):
     """TC12 的边界：冲突只作用于同一 book_id。"""
-    _, _, book_a = http("POST", f"{base_url}/books", {"title": "三体"})
-    _, _, book_b = http("POST", f"{base_url}/books", {"title": "球状闪电"})
+    _, _, book_a = http(
+        "POST", f"{base_url}/books", {"title": "三体", "initial_stock": 1}
+    )
+    _, _, book_b = http(
+        "POST", f"{base_url}/books", {"title": "球状闪电", "initial_stock": 1}
+    )
     http("POST", f"{base_url}/loans", {"book_id": book_a["id"], "borrower": "paul"})
 
     status, _, body = http(

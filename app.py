@@ -1,18 +1,21 @@
-"""图书借还记录 API —— 单文件、仅标准库 (TC2)。
+"""图书借还记录 API —— 单文件、仅标准库。
 
-数据只存在于进程内存，进程重启即清空 (TC19)。
+SKU 与库存存放在 worktree 内的 SQLite；既有 Loan 生命周期仍由进程内状态维护。
 """
 
+import argparse
 import json
+import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlsplit
 
 PORT = 8000
+INVENTORY_DB_PATH = Path(__file__).resolve().parent / ".runtime" / "inventory.sqlite3"
 
-# 进程内存储 (TC19)。id 计数器只增不减，保证 id 永不复用 (TC14)。
-_books: dict[str, dict] = {}
-_book_seq = 0
+# 既有 Loan 生命周期仍使用进程内存储；本轮不改写它的字段和归还行为。
 _loans: dict[str, dict] = {}
 _loan_seq = 0
 
@@ -26,21 +29,60 @@ class NotFound(Exception):
 
 
 def reset_state() -> None:
-    """清空进程内存储，回到干净的初始状态。"""
-    global _book_seq, _loan_seq
-    _books.clear()
-    _book_seq = 0
+    """测试辅助：在服务启动前清空 SQLite 与进程内 Loan 状态。"""
+    global _loan_seq
+    for suffix in ("", "-wal", "-shm"):
+        Path(f"{INVENTORY_DB_PATH}{suffix}").unlink(missing_ok=True)
     _loans.clear()
     _loan_seq = 0
 
 
-def create_book(title: str) -> dict:
-    """新建一本书，id 形态 bk_<n>，n 从 1 起单调递增 (TC9)。"""
-    global _book_seq
-    _book_seq += 1
-    book = {"id": f"bk_{_book_seq}", "title": title}
-    _books[book["id"]] = book
-    return book
+def _connect_inventory() -> sqlite3.Connection:
+    """打开所有服务实例共用的库存数据库，并确保 schema 存在。"""
+    INVENTORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(INVENTORY_DB_PATH, timeout=30)
+    connection.execute("PRAGMA busy_timeout = 30000")
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS books (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            public_id TEXT UNIQUE,
+            title TEXT NOT NULL,
+            available_stock INTEGER NOT NULL CHECK (available_stock >= 0)
+        )
+        """
+    )
+    return connection
+
+
+def create_book(title: str, initial_stock: int) -> dict:
+    """原子创建 SKU，并把初始库存写入共享 SQLite。"""
+    with closing(_connect_inventory()) as connection:
+        with connection:
+            cursor = connection.execute(
+                "INSERT INTO books (title, available_stock) VALUES (?, ?)",
+                (title, initial_stock),
+            )
+            public_id = f"bk_{cursor.lastrowid}"
+            connection.execute(
+                "UPDATE books SET public_id = ? WHERE sequence = ?",
+                (public_id, cursor.lastrowid),
+            )
+    return {
+        "id": public_id,
+        "title": title,
+        "available_stock": initial_stock,
+    }
+
+
+def _book_exists(book_id: str) -> bool:
+    with closing(_connect_inventory()) as connection:
+        row = connection.execute(
+            "SELECT 1 FROM books WHERE public_id = ?",
+            (book_id,),
+        ).fetchone()
+    return row is not None
 
 
 def list_loans() -> list[dict]:
@@ -63,7 +105,7 @@ def create_loan(book_id: str, borrower: str) -> dict:
     borrower 是自由字符串，原样保存 (TC11)。
     """
     global _loan_seq
-    if book_id not in _books:
+    if not _book_exists(book_id):
         raise NotFound(f"no book with id {book_id!r}")
     if _open_loan_for(book_id) is not None:
         raise Conflict("book already on loan")
@@ -127,15 +169,26 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, list_loans())
 
     def _handle_create_book(self):
-        """POST /books → 201 {"id", "title"} (TC3, TC8)."""
+        """POST /books → 201 Book，含原子写入的初始可用库存。"""
         payload = self._read_json()
         if payload is None:
             return
         title = payload.get("title")
+        initial_stock = payload.get("initial_stock")
         if not isinstance(title, str):
             self._send_json(400, {"error": "title must be a string"})
             return
-        self._send_json(201, create_book(title))
+        if (
+            not isinstance(initial_stock, int)
+            or isinstance(initial_stock, bool)
+            or initial_stock < 0
+        ):
+            self._send_json(
+                400,
+                {"error": "initial_stock must be a non-negative integer"},
+            )
+            return
+        self._send_json(201, create_book(title, initial_stock))
 
     def _handle_create_loan(self):
         """POST /loans → 201 Loan / 404 未知 book / 409 已被借出 (TC4, TC7, TC8)."""
@@ -197,10 +250,21 @@ def make_server(port: int = PORT) -> ThreadingHTTPServer:
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 
-if __name__ == "__main__":
-    server = make_server()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Run the book inventory API")
+    parser.add_argument("--port", type=int, default=PORT)
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> None:
+    args = parse_args(argv)
+    server = make_server(args.port)
     print(f"listening on http://localhost:{server.server_address[1]}")  # TC1
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         server.shutdown()
+
+
+if __name__ == "__main__":
+    main()

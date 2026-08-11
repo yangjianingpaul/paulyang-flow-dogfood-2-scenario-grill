@@ -6,7 +6,9 @@ import pytest
 @pytest.fixture
 def book(base_url, http):
     """#1/S1 作为 setup：先建一本书拿 id (DEC3, TC13)。"""
-    _, _, body = http("POST", f"{base_url}/books", {"title": "三体"})
+    _, _, body = http(
+        "POST", f"{base_url}/books", {"title": "三体", "initial_stock": 1}
+    )
     return body
 
 
@@ -75,8 +77,12 @@ def test_list_loans_is_not_filtered_by_returned_state(base_url, http, book):
 
 def test_list_loans_spans_all_books(base_url, http):
     """TC17: 不以书为入口，全部 Loan 在一次响应中返回。"""
-    _, _, book_a = http("POST", f"{base_url}/books", {"title": "三体"})
-    _, _, book_b = http("POST", f"{base_url}/books", {"title": "球状闪电"})
+    _, _, book_a = http(
+        "POST", f"{base_url}/books", {"title": "三体", "initial_stock": 1}
+    )
+    _, _, book_b = http(
+        "POST", f"{base_url}/books", {"title": "球状闪电", "initial_stock": 1}
+    )
     _, _, loan_a = http(
         "POST", f"{base_url}/loans", {"book_id": book_a["id"], "borrower": "paul"}
     )
