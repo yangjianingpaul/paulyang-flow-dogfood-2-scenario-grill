@@ -5,6 +5,7 @@ SKU、库存与 Loan 存放在 worktree 内的共享 SQLite。
 
 import argparse
 import json
+import socket
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
@@ -22,6 +23,12 @@ class Conflict(Exception):
 
 class NotFound(Exception):
     """引用了一个不存在的实体 (TC13)。"""
+
+
+class ConcurrentHTTPServer(ThreadingHTTPServer):
+    """Thread-per-request server with room for the scenario's connection burst."""
+
+    request_queue_size = socket.SOMAXCONN
 
 
 def reset_state() -> None:
@@ -308,7 +315,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(port: int = PORT) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    return ConcurrentHTTPServer(("127.0.0.1", port), Handler)
 
 
 def parse_args(argv=None):
