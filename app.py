@@ -88,6 +88,27 @@ def create_book(title: str, initial_stock: int) -> dict:
     }
 
 
+def get_book(book_id: str) -> dict:
+    """从共享状态源读取单个 SKU 的当前库存。"""
+    with closing(_connect_inventory()) as connection:
+        row = connection.execute(
+            """
+            SELECT public_id, title, available_stock
+            FROM books
+            WHERE public_id = ?
+            """,
+            (book_id,),
+        ).fetchone()
+    if row is None:
+        raise NotFound(f"no book with id {book_id!r}")
+    public_id, title, available_stock = row
+    return {
+        "id": public_id,
+        "title": title,
+        "available_stock": available_stock,
+    }
+
+
 def list_loans() -> list[dict]:
     """全部 Loan，含已归还的；已归还记录不被删除 (TC14)。"""
     with closing(_connect_inventory()) as connection:
@@ -229,8 +250,27 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/loans":
             self._handle_list_loans()
+        elif (book_id := self._match_book_path(path)) is not None:
+            self._handle_get_book(book_id)
         else:
             self._send_json(404, {"error": f"no route for GET {self.path}"})
+
+    @staticmethod
+    def _match_book_path(path: str) -> str | None:
+        """GET /books/<book_id> → book_id。"""
+        parts = path.split("/")
+        if len(parts) == 3 and parts[:2] == ["", "books"]:
+            return parts[2] or None
+        return None
+
+    def _handle_get_book(self, book_id: str):
+        """GET /books/<id> → 200 Book，直接返回共享库存。"""
+        try:
+            book = get_book(book_id)
+        except NotFound as exc:
+            self._send_json(404, {"error": str(exc)})
+        else:
+            self._send_json(200, book)
 
     def _handle_list_loans(self):
         """GET /loans → 200 Loan 数组，含已归还的，顺序不作规定 (TC6, TC8, TC17, TC18)。"""
