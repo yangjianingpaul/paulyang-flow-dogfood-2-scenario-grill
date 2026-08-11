@@ -1,6 +1,6 @@
 """图书借还记录 API —— 单文件、仅标准库。
 
-SKU 与库存存放在 worktree 内的 SQLite；既有 Loan 生命周期仍由进程内状态维护。
+SKU、库存与 Loan 存放在 worktree 内的共享 SQLite。
 """
 
 import argparse
@@ -15,13 +15,9 @@ from urllib.parse import urlsplit
 PORT = 8000
 INVENTORY_DB_PATH = Path(__file__).resolve().parent / ".runtime" / "inventory.sqlite3"
 
-# 既有 Loan 生命周期仍使用进程内存储；本轮不改写它的字段和归还行为。
-_loans: dict[str, dict] = {}
-_loan_seq = 0
-
 
 class Conflict(Exception):
-    """借出被拒：目标 book 已存在一条未归还的 Loan (TC12)。"""
+    """借出被拒：目标 SKU 的可用库存已经耗尽。"""
 
 
 class NotFound(Exception):
@@ -29,12 +25,9 @@ class NotFound(Exception):
 
 
 def reset_state() -> None:
-    """测试辅助：在服务启动前清空 SQLite 与进程内 Loan 状态。"""
-    global _loan_seq
+    """测试辅助：在服务启动前清空共享 SQLite 状态。"""
     for suffix in ("", "-wal", "-shm"):
         Path(f"{INVENTORY_DB_PATH}{suffix}").unlink(missing_ok=True)
-    _loans.clear()
-    _loan_seq = 0
 
 
 def _connect_inventory() -> sqlite3.Connection:
@@ -50,6 +43,18 @@ def _connect_inventory() -> sqlite3.Connection:
             public_id TEXT UNIQUE,
             title TEXT NOT NULL,
             available_stock INTEGER NOT NULL CHECK (available_stock >= 0)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS loans (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            public_id TEXT UNIQUE,
+            book_id TEXT NOT NULL,
+            borrower TEXT NOT NULL,
+            returned_at TEXT,
+            FOREIGN KEY (book_id) REFERENCES books(public_id)
         )
         """
     )
@@ -76,57 +81,113 @@ def create_book(title: str, initial_stock: int) -> dict:
     }
 
 
-def _book_exists(book_id: str) -> bool:
-    with closing(_connect_inventory()) as connection:
-        row = connection.execute(
-            "SELECT 1 FROM books WHERE public_id = ?",
-            (book_id,),
-        ).fetchone()
-    return row is not None
-
-
 def list_loans() -> list[dict]:
     """全部 Loan，含已归还的；已归还记录不被删除 (TC14)。"""
-    return [dict(loan) for loan in _loans.values()]
-
-
-def _open_loan_for(book_id: str) -> dict | None:
-    """该 book 当前未归还的 Loan；不变量保证至多一条 (TC12)。"""
-    for loan in _loans.values():
-        if loan["book_id"] == book_id and loan["returned_at"] is None:
-            return loan
-    return None
+    with closing(_connect_inventory()) as connection:
+        rows = connection.execute(
+            """
+            SELECT public_id, book_id, borrower, returned_at
+            FROM loans
+            ORDER BY sequence
+            """
+        ).fetchall()
+    return [
+        {
+            "id": public_id,
+            "book_id": book_id,
+            "borrower": borrower,
+            "returned_at": returned_at,
+        }
+        for public_id, book_id, borrower, returned_at in rows
+    ]
 
 
 def create_loan(book_id: str, borrower: str) -> dict:
-    """借出一本书。
+    """原子扣减共享库存并创建一条 Loan。"""
+    with closing(_connect_inventory()) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE books
+                SET available_stock = available_stock - 1
+                WHERE public_id = ? AND available_stock > 0
+                """,
+                (book_id,),
+            )
+            if updated.rowcount == 0:
+                exists = connection.execute(
+                    "SELECT 1 FROM books WHERE public_id = ?",
+                    (book_id,),
+                ).fetchone()
+                if exists is None:
+                    raise NotFound(f"no book with id {book_id!r}")
+                raise Conflict("stock exhausted: book already on loan")
 
-    book 必须存在 (TC13)，且当前没有未归还的 Loan (TC12)；
-    borrower 是自由字符串，原样保存 (TC11)。
-    """
-    global _loan_seq
-    if not _book_exists(book_id):
-        raise NotFound(f"no book with id {book_id!r}")
-    if _open_loan_for(book_id) is not None:
-        raise Conflict("book already on loan")
-    _loan_seq += 1
-    loan = {
-        "id": f"ln_{_loan_seq}",
+            cursor = connection.execute(
+                "INSERT INTO loans (book_id, borrower) VALUES (?, ?)",
+                (book_id, borrower),
+            )
+            public_id = f"ln_{cursor.lastrowid}"
+            connection.execute(
+                "UPDATE loans SET public_id = ? WHERE sequence = ?",
+                (public_id, cursor.lastrowid),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "id": public_id,
         "book_id": book_id,
         "borrower": borrower,
         "returned_at": None,
     }
-    _loans[loan["id"]] = loan
-    return dict(loan)
 
 
 def return_loan(loan_id: str) -> dict:
     """未归还 → 已归还的唯一入口，写入服务端当前时刻 (TC15, TC20)。"""
-    loan = _loans.get(loan_id)
-    if loan is None:
-        raise NotFound(f"no loan with id {loan_id!r}")
-    loan["returned_at"] = _now_iso8601_utc()
-    return dict(loan)
+    returned_at = _now_iso8601_utc()
+    with closing(_connect_inventory()) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT book_id, borrower, returned_at
+                FROM loans
+                WHERE public_id = ?
+                """,
+                (loan_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"no loan with id {loan_id!r}")
+            book_id, borrower, existing_returned_at = row
+            if existing_returned_at is None:
+                connection.execute(
+                    "UPDATE loans SET returned_at = ? WHERE public_id = ?",
+                    (returned_at, loan_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE books
+                    SET available_stock = available_stock + 1
+                    WHERE public_id = ?
+                    """,
+                    (book_id,),
+                )
+            else:
+                returned_at = existing_returned_at
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return {
+        "id": loan_id,
+        "book_id": book_id,
+        "borrower": borrower,
+        "returned_at": returned_at,
+    }
 
 
 def _now_iso8601_utc() -> str:
@@ -191,7 +252,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(201, create_book(title, initial_stock))
 
     def _handle_create_loan(self):
-        """POST /loans → 201 Loan / 404 未知 book / 409 已被借出 (TC4, TC7, TC8)."""
+        """POST /loans → 201 Loan / 404 未知 book / 409 库存耗尽。"""
         payload = self._read_json()
         if payload is None:
             return
