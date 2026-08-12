@@ -109,6 +109,41 @@ def get_book(book_id: str) -> dict:
     }
 
 
+def restock_book(book_id: str, quantity: int) -> dict:
+    """原子增加共享库存，并返回本次更新后的 SKU。"""
+    with closing(_connect_inventory()) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            updated = connection.execute(
+                """
+                UPDATE books
+                SET available_stock = available_stock + ?
+                WHERE public_id = ?
+                """,
+                (quantity, book_id),
+            )
+            if updated.rowcount == 0:
+                raise NotFound(f"no book with id {book_id!r}")
+            public_id, title, available_stock = connection.execute(
+                """
+                SELECT public_id, title, available_stock
+                FROM books
+                WHERE public_id = ?
+                """,
+                (book_id,),
+            ).fetchone()
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "id": public_id,
+        "title": title,
+        "available_stock": available_stock,
+    }
+
+
 def list_loans() -> list[dict]:
     """全部 Loan，含已归还的；已归还记录不被删除 (TC14)。"""
     with closing(_connect_inventory()) as connection:
@@ -232,10 +267,20 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_create_book()
         elif self.path == "/loans":
             self._handle_create_loan()
+        elif (book_id := self._match_restock_path(self.path)) is not None:
+            self._handle_restock_book(book_id)
         elif (loan_id := self._match_return_path(self.path)) is not None:
             self._handle_return_loan(loan_id)
         else:
             self._send_json(404, {"error": f"no route for POST {self.path}"})
+
+    @staticmethod
+    def _match_restock_path(path: str) -> str | None:
+        """POST /books/<book_id>/restock → book_id。"""
+        parts = path.split("/")
+        if len(parts) == 4 and parts[:2] == ["", "books"] and parts[3] == "restock":
+            return parts[2] or None
+        return None
 
     @staticmethod
     def _match_return_path(path: str) -> str | None:
@@ -319,6 +364,29 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(409, {"error": str(exc)})
         else:
             self._send_json(201, loan)
+
+    def _handle_restock_book(self, book_id: str):
+        """POST /books/<id>/restock → 200 更新后的 Book。"""
+        payload = self._read_json()
+        if payload is None:
+            return
+        quantity = payload.get("quantity")
+        if (
+            not isinstance(quantity, int)
+            or isinstance(quantity, bool)
+            or quantity <= 0
+        ):
+            self._send_json(
+                400,
+                {"error": "quantity must be a positive integer"},
+            )
+            return
+        try:
+            book = restock_book(book_id, quantity)
+        except NotFound as exc:
+            self._send_json(404, {"error": str(exc)})
+        else:
+            self._send_json(200, book)
 
     def _handle_return_loan(self, loan_id: str):
         """POST /loans/<loan_id>/return → 200 Loan (TC5, TC8)；无请求体。"""
