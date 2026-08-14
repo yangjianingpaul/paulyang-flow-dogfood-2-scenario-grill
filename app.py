@@ -19,6 +19,9 @@ INVENTORY_DB_PATH = Path(__file__).resolve().parent / ".runtime" / "inventory.sq
 # 等待集合中的每一条预约都处于该状态；兑现即移出集合 (TC2, TC6)。
 WAITING = "waiting"
 
+# 兑现响应中被移出等待集合的那条预约的状态；不落库，也不是新的中间状态 (DEC14)。
+FULFILLED = "fulfilled"
+
 
 class Conflict(Exception):
     """借出被拒：目标 SKU 的可用库存已经耗尽。"""
@@ -26,6 +29,10 @@ class Conflict(Exception):
 
 class ReservationRejected(Exception):
     """登记被拒：该 SKU 仍有可用库存，应当直接借阅 (TC4)。"""
+
+
+class NoWaitingReservation(Exception):
+    """兑现被拒：该 SKU 的等待队列为空，先于库存判断 (DEC5)。"""
 
 
 class NotFound(Exception):
@@ -373,6 +380,90 @@ def list_reservations(book_id: str) -> list[dict]:
     ]
 
 
+def fulfill_head_reservation(book_id: str) -> dict:
+    """兑现当前队首：一个原子事务内扣库存、移出等待集合并创建 Loan (TC3, TC4)。
+
+    先判断等待者、再判断库存：空队列一律失败为「没有等待者」，与库存无关 (DEC5)。
+    任一失败分支都在 rollback 后返回，Book、Reservation 与 Loan 均不改变 (TC4)。
+    """
+    with closing(_connect_inventory()) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            book = connection.execute(
+                "SELECT available_stock FROM books WHERE public_id = ?",
+                (book_id,),
+            ).fetchone()
+            if book is None:
+                raise NotFound(f"no book with id {book_id!r}")
+            (available_stock,) = book
+
+            head = connection.execute(
+                """
+                SELECT sequence, public_id, holder
+                FROM reservations
+                WHERE book_id = ?
+                ORDER BY sequence
+                LIMIT 1
+                """,
+                (book_id,),
+            ).fetchone()
+            if head is None:
+                raise NoWaitingReservation(
+                    "no waiting reservation: nobody is queued for this book"
+                )
+            sequence, reservation_id, holder = head
+
+            if available_stock <= 0:
+                raise Conflict(
+                    "stock exhausted: no available stock to fulfil this "
+                    "reservation until a copy is returned"
+                )
+
+            connection.execute(
+                """
+                UPDATE books
+                SET available_stock = available_stock - 1
+                WHERE public_id = ? AND available_stock > 0
+                """,
+                (book_id,),
+            )
+            connection.execute(
+                "DELETE FROM reservations WHERE sequence = ?",
+                (sequence,),
+            )
+            cursor = connection.execute(
+                "INSERT INTO loans (book_id, borrower) VALUES (?, ?)",
+                (book_id, holder),
+            )
+            loan_id = f"ln_{cursor.lastrowid}"
+            connection.execute(
+                "UPDATE loans SET public_id = ? WHERE sequence = ?",
+                (loan_id, cursor.lastrowid),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "reservation": {
+            "id": reservation_id,
+            "book_id": book_id,
+            "holder": holder,
+            "status": FULFILLED,
+            # 兑现只发生在队首，这里记录它被兑现时所处的位置 (DEC3, DEC10)。
+            "position": 1,
+        },
+        "loan": {
+            "id": loan_id,
+            "book_id": book_id,
+            # 兑现出的 Loan 的 borrower 与 holder 逐字相同 (DEC7)。
+            "borrower": holder,
+            "returned_at": None,
+        },
+    }
+
+
 def _now_iso8601_utc() -> str:
     """UTC ISO-8601，以 Z 结尾 (TC20)。"""
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -389,12 +480,26 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_create_loan()
         elif self.path == "/reservations":
             self._handle_create_reservation()
+        elif (book_id := self._match_fulfill_path(self.path)) is not None:
+            self._handle_fulfill_reservation(book_id)
         elif (book_id := self._match_restock_path(self.path)) is not None:
             self._handle_restock_book(book_id)
         elif (loan_id := self._match_return_path(self.path)) is not None:
             self._handle_return_loan(loan_id)
         else:
             self._send_json(404, {"error": f"no route for POST {self.path}"})
+
+    @staticmethod
+    def _match_fulfill_path(path: str) -> str | None:
+        """POST /books/<book_id>/reservations/fulfill → book_id (TC1)。"""
+        parts = path.split("/")
+        if (
+            len(parts) == 5
+            and parts[:2] == ["", "books"]
+            and parts[3:] == ["reservations", "fulfill"]
+        ):
+            return parts[2] or None
+        return None
 
     @staticmethod
     def _match_restock_path(path: str) -> str | None:
@@ -531,6 +636,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": str(exc)})
         else:
             self._send_json(200, reservations)
+
+    def _handle_fulfill_reservation(self, book_id: str):
+        """POST /books/<id>/reservations/fulfill → 201 {reservation, loan}
+
+        404 未知 book / 409 没有等待者 / 409 没有可用库存 (TC1, DEC5, DEC6)；无请求体。
+        """
+        try:
+            fulfillment = fulfill_head_reservation(book_id)
+        except NotFound as exc:
+            self._send_json(404, {"error": str(exc)})
+        except NoWaitingReservation as exc:
+            self._send_json(409, {"error": str(exc)})
+        except Conflict as exc:
+            self._send_json(409, {"error": str(exc)})
+        else:
+            self._send_json(201, fulfillment)
 
     def _handle_restock_book(self, book_id: str):
         """POST /books/<id>/restock → 200 更新后的 Book。"""
