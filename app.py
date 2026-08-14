@@ -35,6 +35,10 @@ class NoWaitingReservation(Exception):
     """兑现被拒：该 SKU 的等待队列为空，先于库存判断 (DEC5)。"""
 
 
+class QueuedForReservation(Exception):
+    """普通借阅被拒：该 SKU 有等待队列，只能由馆员兑现队首 (DEC11)。"""
+
+
 class NotFound(Exception):
     """引用了一个不存在的实体 (TC13)。"""
 
@@ -192,10 +196,23 @@ def list_loans() -> list[dict]:
 
 
 def create_loan(book_id: str, borrower: str) -> dict:
-    """原子扣减共享库存并创建一条 Loan。"""
+    """原子扣减共享库存并创建一条 Loan。
+
+    该 SKU 有等待队列时，任何普通借阅都不得消耗库存，队首本人也不例外 (DEC11, TC3)。
+    队列判断先于库存判断：被拒的原因是队列存在，与当前是否有库存无关。
+    """
     with closing(_connect_inventory()) as connection:
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM reservations WHERE book_id = ? LIMIT 1",
+                (book_id,),
+            ).fetchone():
+                raise QueuedForReservation(
+                    "reservation queue is not empty: this book must be handed "
+                    "out by fulfilling the head of the waiting queue"
+                )
+
             updated = connection.execute(
                 """
                 UPDATE books
@@ -585,7 +602,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(201, create_book(title, initial_stock))
 
     def _handle_create_loan(self):
-        """POST /loans → 201 Loan / 404 未知 book / 409 库存耗尽。"""
+        """POST /loans → 201 Loan / 404 未知 book / 409 有等待队列 / 409 库存耗尽。"""
         payload = self._read_json()
         if payload is None:
             return
@@ -601,6 +618,8 @@ class Handler(BaseHTTPRequestHandler):
             loan = create_loan(book_id, borrower)
         except NotFound as exc:
             self._send_json(404, {"error": str(exc)})
+        except QueuedForReservation as exc:
+            self._send_json(409, {"error": str(exc)})
         except Conflict as exc:
             self._send_json(409, {"error": str(exc)})
         else:
