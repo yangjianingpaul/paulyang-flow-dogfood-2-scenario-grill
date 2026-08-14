@@ -16,9 +16,16 @@ from urllib.parse import urlsplit
 PORT = 8000
 INVENTORY_DB_PATH = Path(__file__).resolve().parent / ".runtime" / "inventory.sqlite3"
 
+# 等待集合中的每一条预约都处于该状态；兑现即移出集合 (TC2, TC6)。
+WAITING = "waiting"
+
 
 class Conflict(Exception):
     """借出被拒：目标 SKU 的可用库存已经耗尽。"""
+
+
+class ReservationRejected(Exception):
+    """登记被拒：该 SKU 仍有可用库存，应当直接借阅 (TC4)。"""
 
 
 class NotFound(Exception):
@@ -61,6 +68,18 @@ def _connect_inventory() -> sqlite3.Connection:
             book_id TEXT NOT NULL,
             borrower TEXT NOT NULL,
             returned_at TEXT,
+            FOREIGN KEY (book_id) REFERENCES books(public_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reservations (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            public_id TEXT UNIQUE,
+            book_id TEXT NOT NULL,
+            holder TEXT NOT NULL,
+            UNIQUE (book_id, holder),
             FOREIGN KEY (book_id) REFERENCES books(public_id)
         )
         """
@@ -253,6 +272,107 @@ def return_loan(loan_id: str) -> dict:
     }
 
 
+def create_reservation(book_id: str, holder: str) -> tuple[dict, bool]:
+    """登记一条等待预约，返回 (Reservation, 是否新建)。
+
+    重复登记复用既有等待预约；只有从「无预约」进入等待时才要求库存为零 (TC4)。
+    """
+    with closing(_connect_inventory()) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            book = connection.execute(
+                "SELECT available_stock FROM books WHERE public_id = ?",
+                (book_id,),
+            ).fetchone()
+            if book is None:
+                raise NotFound(f"no book with id {book_id!r}")
+            (available_stock,) = book
+
+            existing = connection.execute(
+                """
+                SELECT sequence, public_id
+                FROM reservations
+                WHERE book_id = ? AND holder = ?
+                """,
+                (book_id, holder),
+            ).fetchone()
+
+            if existing is not None:
+                sequence, public_id = existing
+                created = False
+            else:
+                if available_stock > 0:
+                    raise ReservationRejected(
+                        "stock available: borrow this book directly "
+                        "instead of reserving it"
+                    )
+                cursor = connection.execute(
+                    "INSERT INTO reservations (book_id, holder) VALUES (?, ?)",
+                    (book_id, holder),
+                )
+                sequence = cursor.lastrowid
+                public_id = f"rs_{sequence}"
+                connection.execute(
+                    "UPDATE reservations SET public_id = ? WHERE sequence = ?",
+                    (public_id, sequence),
+                )
+                created = True
+
+            (position,) = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM reservations
+                WHERE book_id = ? AND sequence <= ?
+                """,
+                (book_id, sequence),
+            ).fetchone()
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return (
+        {
+            "id": public_id,
+            "book_id": book_id,
+            "holder": holder,
+            "status": WAITING,
+            "position": position,
+        },
+        created,
+    )
+
+
+def list_reservations(book_id: str) -> list[dict]:
+    """该 SKU 的等待预约，按服务端确认成功顺序排列 (TC5)。"""
+    with closing(_connect_inventory()) as connection:
+        book = connection.execute(
+            "SELECT 1 FROM books WHERE public_id = ?",
+            (book_id,),
+        ).fetchone()
+        if book is None:
+            raise NotFound(f"no book with id {book_id!r}")
+        rows = connection.execute(
+            """
+            SELECT public_id, holder
+            FROM reservations
+            WHERE book_id = ?
+            ORDER BY sequence
+            """,
+            (book_id,),
+        ).fetchall()
+    return [
+        {
+            "id": public_id,
+            "book_id": book_id,
+            "holder": holder,
+            "status": WAITING,
+            "position": position,
+        }
+        for position, (public_id, holder) in enumerate(rows, start=1)
+    ]
+
+
 def _now_iso8601_utc() -> str:
     """UTC ISO-8601，以 Z 结尾 (TC20)。"""
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -267,6 +387,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_create_book()
         elif self.path == "/loans":
             self._handle_create_loan()
+        elif self.path == "/reservations":
+            self._handle_create_reservation()
         elif (book_id := self._match_restock_path(self.path)) is not None:
             self._handle_restock_book(book_id)
         elif (loan_id := self._match_return_path(self.path)) is not None:
@@ -295,10 +417,24 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/loans":
             self._handle_list_loans()
+        elif (book_id := self._match_reservations_path(path)) is not None:
+            self._handle_list_reservations(book_id)
         elif (book_id := self._match_book_path(path)) is not None:
             self._handle_get_book(book_id)
         else:
             self._send_json(404, {"error": f"no route for GET {self.path}"})
+
+    @staticmethod
+    def _match_reservations_path(path: str) -> str | None:
+        """GET /books/<book_id>/reservations → book_id (TC1)。"""
+        parts = path.split("/")
+        if (
+            len(parts) == 4
+            and parts[:2] == ["", "books"]
+            and parts[3] == "reservations"
+        ):
+            return parts[2] or None
+        return None
 
     @staticmethod
     def _match_book_path(path: str) -> str | None:
@@ -364,6 +500,37 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(409, {"error": str(exc)})
         else:
             self._send_json(201, loan)
+
+    def _handle_create_reservation(self):
+        """POST /reservations → 201 新建 / 200 复用 / 404 未知 book / 409 仍有库存。"""
+        payload = self._read_json()
+        if payload is None:
+            return
+        book_id = payload.get("book_id")
+        holder = payload.get("holder")
+        if not isinstance(book_id, str) or not book_id:
+            self._send_json(400, {"error": "book_id must be a non-empty string"})
+            return
+        if not isinstance(holder, str) or not holder:
+            self._send_json(400, {"error": "holder must be a non-empty string"})
+            return
+        try:
+            reservation, created = create_reservation(book_id, holder)
+        except NotFound as exc:
+            self._send_json(404, {"error": str(exc)})
+        except ReservationRejected as exc:
+            self._send_json(409, {"error": str(exc)})
+        else:
+            self._send_json(201 if created else 200, reservation)
+
+    def _handle_list_reservations(self, book_id: str):
+        """GET /books/<id>/reservations → 200 等待预约数组 (TC5)。"""
+        try:
+            reservations = list_reservations(book_id)
+        except NotFound as exc:
+            self._send_json(404, {"error": str(exc)})
+        else:
+            self._send_json(200, reservations)
 
     def _handle_restock_book(self, book_id: str):
         """POST /books/<id>/restock → 200 更新后的 Book。"""
