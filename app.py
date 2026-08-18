@@ -325,7 +325,9 @@ def return_loan(loan_id: str) -> dict:
 def create_reservation(book_id: str, holder: str) -> tuple[dict, bool]:
     """登记一条等待预约，返回 (Reservation, 是否新建)。
 
-    重复登记复用既有等待预约；只有从「无预约」进入等待时才要求库存为零 (TC4)。
+    重复登记复用既有等待预约。新 holder 的准入取决于该 SKU 的等待队列是否非空
+    (#36/TC4, #36/DEC6)：队列非空时无论库存多少一律接受并排到队尾；队列为空时
+    沿用既有准入，只有库存为零才允许进入等待。
     """
     with closing(_connect_inventory()) as connection:
         try:
@@ -351,7 +353,14 @@ def create_reservation(book_id: str, holder: str) -> tuple[dict, bool]:
                 sequence, public_id = existing
                 created = False
             else:
-                if available_stock > 0:
+                # 准入由该 SKU 的等待队列是否非空决定 (#36/TC4, #36/DEC6)：队列非空时
+                # 队列优先于可用库存，新 holder 一律追加至队尾；队列为空时 #26/DEC2
+                # 原样成立 —— 有库存则拒绝并提示直接借阅，无库存则登记成功。
+                queue_active = connection.execute(
+                    "SELECT 1 FROM reservations WHERE book_id = ? LIMIT 1",
+                    (book_id,),
+                ).fetchone()
+                if queue_active is None and available_stock > 0:
                     raise ReservationRejected(
                         "stock available: borrow this book directly "
                         "instead of reserving it"
