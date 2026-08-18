@@ -22,6 +22,13 @@ WAITING = "waiting"
 # 兑现响应中被移出等待集合的那条预约的状态；不落库，也不是新的中间状态 (DEC14)。
 FULFILLED = "fulfilled"
 
+# 普通借阅因等待队列被拒时的机器可读原因常量 (TC1)。
+RESERVATION_QUEUE_ACTIVE = "reservation_queue_active"
+
+# 该拒绝携带的下一步取值域；由请求者是否已在该 SKU 的等待队列中决定 (TC1, TC5)。
+CREATE_RESERVATION = "create_reservation"
+WAIT_FOR_FULFILLMENT = "wait_for_fulfillment"
+
 
 class Conflict(Exception):
     """借出被拒：目标 SKU 的可用库存已经耗尽。"""
@@ -36,7 +43,16 @@ class NoWaitingReservation(Exception):
 
 
 class QueuedForReservation(Exception):
-    """普通借阅被拒：该 SKU 有等待队列，只能由馆员兑现队首 (DEC11)。"""
+    """普通借阅被拒：该 SKU 有等待队列，只能由馆员兑现队首 (DEC11)。
+
+    `next_action` 是调用方无需解析文案就能执行的下一步 (TC1, TC5)：
+    请求者尚未在该 SKU 的等待队列中取 CREATE_RESERVATION，已在其中取
+    WAIT_FOR_FULFILLMENT；队首与非队首不作区分。
+    """
+
+    def __init__(self, message: str, next_action: str):
+        super().__init__(message)
+        self.next_action = next_action
 
 
 class NotFound(Exception):
@@ -208,9 +224,19 @@ def create_loan(book_id: str, borrower: str) -> dict:
                 "SELECT 1 FROM reservations WHERE book_id = ? LIMIT 1",
                 (book_id,),
             ).fetchone():
+                already_waiting = connection.execute(
+                    """
+                    SELECT 1
+                    FROM reservations
+                    WHERE book_id = ? AND holder = ?
+                    LIMIT 1
+                    """,
+                    (book_id, borrower),
+                ).fetchone()
                 raise QueuedForReservation(
                     "reservation queue is not empty: this book must be handed "
-                    "out by fulfilling the head of the waiting queue"
+                    "out by fulfilling the head of the waiting queue",
+                    WAIT_FOR_FULFILLMENT if already_waiting else CREATE_RESERVATION,
                 )
 
             updated = connection.execute(
@@ -619,7 +645,14 @@ class Handler(BaseHTTPRequestHandler):
         except NotFound as exc:
             self._send_json(404, {"error": str(exc)})
         except QueuedForReservation as exc:
-            self._send_json(409, {"error": str(exc)})
+            self._send_json(
+                409,
+                {
+                    "error": str(exc),
+                    "code": RESERVATION_QUEUE_ACTIVE,
+                    "next_action": exc.next_action,
+                },
+            )
         except Conflict as exc:
             self._send_json(409, {"error": str(exc)})
         else:
