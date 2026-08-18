@@ -45,7 +45,11 @@ def _queued_book_with_one_copy(http, base_url):
 
 
 def test_s18_an_outsider_cannot_borrow_past_the_queue(base_url, http):
-    """#26/S18, DEC11/TC3: mallory 的普通借阅失败，并提示应通过兑现队首处理。"""
+    """#26/S18, DEC11/TC3: mallory 的普通借阅失败，并提示应通过兑现队首处理。
+
+    #37/TC8: 响应体在 #36/S4 之后还带 `code` 与 `next_action`，此处只断言
+    #26/S18 要求的口径（409 + 非空可读 `error`），不再断言键集恰好为 `error`。
+    """
     book, _, _, _ = _queued_book_with_one_copy(http, base_url)
 
     status, headers, body = _borrow(http, base_url, book["id"], "mallory")
@@ -55,7 +59,6 @@ def test_s18_an_outsider_cannot_borrow_past_the_queue(base_url, http):
     assert isinstance(body["error"], str) and body["error"]
     assert "queue" in body["error"].lower()
     assert "fulfil" in body["error"].lower()
-    assert set(body) == {"error"}
 
 
 def test_s19_the_head_of_the_queue_cannot_borrow_directly_either(base_url, http):
