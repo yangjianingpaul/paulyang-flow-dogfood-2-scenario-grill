@@ -106,6 +106,9 @@ def _connect_inventory() -> sqlite3.Connection:
             public_id TEXT UNIQUE,
             book_id TEXT NOT NULL,
             holder TEXT NOT NULL,
+            -- 该 SKU 内的队列序，从 1 起连续；登记时追加至队尾，处置时被改写，
+            -- 因此它与单调自增的 sequence 分开 (#42/TC5)。
+            queue_order INTEGER NOT NULL,
             UNIQUE (book_id, holder),
             FOREIGN KEY (book_id) REFERENCES books(public_id)
         )
@@ -366,8 +369,19 @@ def create_reservation(book_id: str, holder: str) -> tuple[dict, bool]:
                         "instead of reserving it"
                     )
                 cursor = connection.execute(
-                    "INSERT INTO reservations (book_id, holder) VALUES (?, ?)",
-                    (book_id, holder),
+                    """
+                    INSERT INTO reservations (book_id, holder, queue_order)
+                    VALUES (
+                        ?,
+                        ?,
+                        (
+                            SELECT COALESCE(MAX(queue_order), 0) + 1
+                            FROM reservations
+                            WHERE book_id = ?
+                        )
+                    )
+                    """,
+                    (book_id, holder, book_id),
                 )
                 sequence = cursor.lastrowid
                 public_id = f"rs_{sequence}"
@@ -381,7 +395,9 @@ def create_reservation(book_id: str, holder: str) -> tuple[dict, bool]:
                 """
                 SELECT COUNT(*)
                 FROM reservations
-                WHERE book_id = ? AND sequence <= ?
+                WHERE book_id = ? AND queue_order <= (
+                    SELECT queue_order FROM reservations WHERE sequence = ?
+                )
                 """,
                 (book_id, sequence),
             ).fetchone()
@@ -403,7 +419,7 @@ def create_reservation(book_id: str, holder: str) -> tuple[dict, bool]:
 
 
 def list_reservations(book_id: str) -> list[dict]:
-    """该 SKU 的等待预约，按服务端确认成功顺序排列 (TC5)。"""
+    """该 SKU 的等待预约，按当前队列顺序排列 (TC5, #42/TC8)。"""
     with closing(_connect_inventory()) as connection:
         book = connection.execute(
             "SELECT 1 FROM books WHERE public_id = ?",
@@ -416,7 +432,7 @@ def list_reservations(book_id: str) -> list[dict]:
             SELECT public_id, holder
             FROM reservations
             WHERE book_id = ?
-            ORDER BY sequence
+            ORDER BY queue_order
             """,
             (book_id,),
         ).fetchall()
@@ -454,7 +470,7 @@ def fulfill_head_reservation(book_id: str) -> dict:
                 SELECT sequence, public_id, holder
                 FROM reservations
                 WHERE book_id = ?
-                ORDER BY sequence
+                ORDER BY queue_order
                 LIMIT 1
                 """,
                 (book_id,),
@@ -516,6 +532,62 @@ def fulfill_head_reservation(book_id: str) -> dict:
     }
 
 
+def defer_head_reservation(book_id: str) -> dict:
+    """处置长期不出现的队首：把他排到当前队列的末位 (#42/TC1, #42/TC5)。
+
+    只改队列序 —— 不新建、不删除任何等待预约，被处置者的 id 与 holder 原样保留，
+    他仍然处于等待中，其余等待者按原相对顺序整体前移一位 (DEC1, DEC2, #42/TC3)。
+    同一事务内不触碰 available_stock，也不创建 Loan：这一步不发书，把书交给新队首
+    仍然是馆员后续一次独立的兑现动作 (DEC4, #42/TC4)。
+    """
+    with closing(_connect_inventory()) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            book = connection.execute(
+                "SELECT 1 FROM books WHERE public_id = ?",
+                (book_id,),
+            ).fetchone()
+            if book is None:
+                raise NotFound(f"no book with id {book_id!r}")
+
+            queue = connection.execute(
+                """
+                SELECT sequence, public_id, holder
+                FROM reservations
+                WHERE book_id = ?
+                ORDER BY queue_order
+                """,
+                (book_id,),
+            ).fetchall()
+            if not queue:
+                raise NoWaitingReservation(
+                    "no waiting reservation: nobody is queued for this book"
+                )
+
+            # 队首移到末位，其余整体前移一位；队列只剩他一人时顺序不变 (#42/TC5)。
+            head, *rest = queue
+            for position, (sequence, _, _) in enumerate([*rest, head], start=1):
+                connection.execute(
+                    "UPDATE reservations SET queue_order = ? WHERE sequence = ?",
+                    (position, sequence),
+                )
+            _, reservation_id, holder = head
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "id": reservation_id,
+        "book_id": book_id,
+        "holder": holder,
+        # 处置只调整队列，被处置者仍然处于等待中 (DEC1, #42/TC3)。
+        "status": WAITING,
+        # 处置完成后的位置：当前队列的末位 (DEC2, #42/TC1)。
+        "position": len(queue),
+    }
+
+
 def _now_iso8601_utc() -> str:
     """UTC ISO-8601，以 Z 结尾 (TC20)。"""
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -534,6 +606,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_create_reservation()
         elif (book_id := self._match_fulfill_path(self.path)) is not None:
             self._handle_fulfill_reservation(book_id)
+        elif (book_id := self._match_defer_path(self.path)) is not None:
+            self._handle_defer_reservation(book_id)
         elif (book_id := self._match_restock_path(self.path)) is not None:
             self._handle_restock_book(book_id)
         elif (loan_id := self._match_return_path(self.path)) is not None:
@@ -549,6 +623,18 @@ class Handler(BaseHTTPRequestHandler):
             len(parts) == 5
             and parts[:2] == ["", "books"]
             and parts[3:] == ["reservations", "fulfill"]
+        ):
+            return parts[2] or None
+        return None
+
+    @staticmethod
+    def _match_defer_path(path: str) -> str | None:
+        """POST /books/<book_id>/reservations/defer → book_id (#42/TC1)。"""
+        parts = path.split("/")
+        if (
+            len(parts) == 5
+            and parts[:2] == ["", "books"]
+            and parts[3:] == ["reservations", "defer"]
         ):
             return parts[2] or None
         return None
@@ -713,6 +799,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(409, {"error": str(exc)})
         else:
             self._send_json(201, fulfillment)
+
+    def _handle_defer_reservation(self, book_id: str):
+        """POST /books/<id>/reservations/defer → 200 被处置的那条等待预约
+
+        404 未知 book / 409 没有等待者 (#42/TC1)；无请求体，响应中不含任何 Loan。
+        """
+        try:
+            reservation = defer_head_reservation(book_id)
+        except NotFound as exc:
+            self._send_json(404, {"error": str(exc)})
+        except NoWaitingReservation as exc:
+            self._send_json(409, {"error": str(exc)})
+        else:
+            self._send_json(200, reservation)
 
     def _handle_restock_book(self, book_id: str):
         """POST /books/<id>/restock → 200 更新后的 Book。"""
