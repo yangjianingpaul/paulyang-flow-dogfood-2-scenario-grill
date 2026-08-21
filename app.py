@@ -83,7 +83,12 @@ def _connect_inventory() -> sqlite3.Connection:
             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
             public_id TEXT UNIQUE,
             title TEXT NOT NULL,
-            available_stock INTEGER NOT NULL CHECK (available_stock >= 0)
+            available_stock INTEGER NOT NULL CHECK (available_stock >= 0),
+            -- 一次性放行：队列只剩一人时的处置让出当前这一本的优先权。
+            -- 它是属于该 SKU 的状态量，不属于任何一条预约，因此存在 books 上；
+            -- 取值是被处置的那条等待预约的 public_id，NULL 表示当前没有放行。
+            -- 记住是谁被处置，才能让放行只对那个人所在的单人队列生效 (#42/TC3, #42/TC6)。
+            solo_defer_release TEXT
         )
         """
     )
@@ -219,23 +224,42 @@ def create_loan(book_id: str, borrower: str) -> dict:
 
     该 SKU 有等待队列时，任何普通借阅都不得消耗库存，队首本人也不例外 (DEC11, TC3)。
     队列判断先于库存判断：被拒的原因是队列存在，与当前是否有库存无关。
+
+    这条规则有且只有一个例外 (#42/DEC6, #42/TC6)：队列只剩一人、他就是被处置产生
+    一次性放行的那个队首、且该次放行尚未被消耗时，队首以外的 borrower 不再被队列
+    规则拒绝，转由既有库存判定继续，借阅成功即消耗这次放行。放行从未产生、已被
+    消耗、处置时队列还有其他等待者、以及队首本人走普通借阅这四种状态下，上面那条
+    规则原样无条件成立 —— 队首要拿到这一本，仍然只能经由馆员兑现。
     """
     with closing(_connect_inventory()) as connection:
         try:
             connection.execute("BEGIN IMMEDIATE")
-            if connection.execute(
-                "SELECT 1 FROM reservations WHERE book_id = ? LIMIT 1",
+            queue = connection.execute(
+                """
+                SELECT public_id, holder
+                FROM reservations
+                WHERE book_id = ?
+                ORDER BY queue_order
+                """,
                 (book_id,),
-            ).fetchone():
-                already_waiting = connection.execute(
-                    """
-                    SELECT 1
-                    FROM reservations
-                    WHERE book_id = ? AND holder = ?
-                    LIMIT 1
-                    """,
-                    (book_id, borrower),
+            ).fetchall()
+
+            released = False
+            if queue:
+                release = connection.execute(
+                    "SELECT solo_defer_release FROM books WHERE public_id = ?",
+                    (book_id,),
                 ).fetchone()
+                head_id, head_holder = queue[0]
+                released = (
+                    len(queue) == 1
+                    and release is not None
+                    and release[0] == head_id
+                    and head_holder != borrower
+                )
+
+            if queue and not released:
+                already_waiting = any(holder == borrower for _, holder in queue)
                 raise QueuedForReservation(
                     "reservation queue is not empty: this book must be handed "
                     "out by fulfilling the head of the waiting queue",
@@ -268,6 +292,13 @@ def create_loan(book_id: str, borrower: str) -> dict:
                 "UPDATE loans SET public_id = ? WHERE sequence = ?",
                 (public_id, cursor.lastrowid),
             )
+            if released:
+                # 放行是一次性的：借到手即消耗，乙的优先权就此恢复 (DEC3, #42/TC6)。
+                # 与扣减库存、创建 Loan 同属这一个事务，借阅失败就不会消耗 (#42/TC9)。
+                connection.execute(
+                    "UPDATE books SET solo_defer_release = NULL WHERE public_id = ?",
+                    (book_id,),
+                )
             connection.commit()
         except Exception:
             connection.rollback()
@@ -539,6 +570,10 @@ def defer_head_reservation(book_id: str) -> dict:
     他仍然处于等待中，其余等待者按原相对顺序整体前移一位 (DEC1, DEC2, #42/TC3)。
     同一事务内不触碰 available_stock，也不创建 Loan：这一步不发书，把书交给新队首
     仍然是馆员后续一次独立的兑现动作 (DEC4, #42/TC4)。
+
+    队列只剩他一人时队尾轮换是空操作，这时同一个处置改为让出当前这一本的优先权：
+    记下一次性放行，使队首以外的读者可以直接借走这一本 (DEC3, #42/TC6)。放行不写进
+    任何一条预约，被处置者的 id、holder 与位置一个都不变 (#42/TC3, #42/TC5)。
     """
     with closing(_connect_inventory()) as connection:
         try:
@@ -572,6 +607,14 @@ def defer_head_reservation(book_id: str) -> dict:
                     (position, sequence),
                 )
             _, reservation_id, holder = head
+
+            # 队列只剩他一人时，同一个处置额外让出这一本的优先权 (DEC3, #42/TC6)。
+            # 处置发生时还有其他等待者的不产生放行 —— 那时队尾轮换已经是解法 (DEC6)。
+            if not rest:
+                connection.execute(
+                    "UPDATE books SET solo_defer_release = ? WHERE public_id = ?",
+                    (reservation_id, book_id),
+                )
             connection.commit()
         except Exception:
             connection.rollback()
