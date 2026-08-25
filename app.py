@@ -29,6 +29,9 @@ RESERVATION_QUEUE_ACTIVE = "reservation_queue_active"
 CREATE_RESERVATION = "create_reservation"
 WAIT_FOR_FULFILLMENT = "wait_for_fulfillment"
 
+# 取消被拒时的机器可读原因常量：冒用与取消一条不存在的预约共用它 (#48/DEC4, #49/TC3)。
+RESERVATION_NOT_FOUND = "reservation_not_found"
+
 
 class Conflict(Exception):
     """借出被拒：目标 SKU 的可用库存已经耗尽。"""
@@ -53,6 +56,15 @@ class QueuedForReservation(Exception):
     def __init__(self, message: str, next_action: str):
         super().__init__(message)
         self.next_action = next_action
+
+
+class ReservationNotFound(Exception):
+    """取消被拒：没有一条当前存在的等待预约同时匹配 reservation_id 与 holder。
+
+    冒用他人的预约 ID 与取消一条已取消 / 已兑现 / 从未存在的预约共用这一种拒绝，
+    对调用方不可区分 —— 区分开会让冒用者从响应里读出「这个 ID 确实存在、只是
+    属于别人」(#48/DEC4, #49/TC3)。异常消息因此不携带任何一方的 holder。
+    """
 
 
 class NotFound(Exception):
@@ -631,6 +643,54 @@ def defer_head_reservation(book_id: str) -> dict:
     }
 
 
+def cancel_reservation(reservation_id: str, holder: str) -> dict:
+    """预约者本人取消自己的等待预约：把那一行从等待集合中删除 (#48/DEC1, #49/TC5)。
+
+    成立的条件恰有两个，缺一即被拒：该 reservation_id 当前存在于 reservations 表中，
+    且该行的 holder 与请求逐字相等。两个条件在同一事务内由一次联合定位一并判断，
+    定位不到就 rollback 抛出同一种拒绝 —— reservations、books、loans 三张表一行都
+    不改变 (#48/DEC4, #49/TC3, #49/TC7)。
+
+    取消只删除目标行，不改写其余等待者的 queue_order：position 的连续收敛由
+    list_reservations 的既有列表口径给出 (#49/TC6)。也不触碰 books.solo_defer_release：
+    放行跟的是被处置的那条预约，那条预约被取消之后该列继续持有一个已不存在的
+    public_id，由 AUTOINCREMENT 的永不复用保证它再也不会与任何新队首相等，
+    放行判定原样留给 create_loan (#48/DEC5, #49/TC4)。
+    """
+    with closing(_connect_inventory()) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT sequence, book_id
+                FROM reservations
+                WHERE public_id = ? AND holder = ?
+                """,
+                (reservation_id, holder),
+            ).fetchone()
+            if row is None:
+                raise ReservationNotFound(
+                    "no waiting reservation matches this reservation id "
+                    "and holder"
+                )
+            sequence, book_id = row
+
+            connection.execute(
+                "DELETE FROM reservations WHERE sequence = ?",
+                (sequence,),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "id": reservation_id,
+        "book_id": book_id,
+        "holder": holder,
+    }
+
+
 def _now_iso8601_utc() -> str:
     """UTC ISO-8601，以 Z 结尾 (TC20)。"""
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -647,6 +707,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_create_loan()
         elif self.path == "/reservations":
             self._handle_create_reservation()
+        elif self.path == "/reservations/cancel":
+            self._handle_cancel_reservation()
         elif (book_id := self._match_fulfill_path(self.path)) is not None:
             self._handle_fulfill_reservation(book_id)
         elif (book_id := self._match_defer_path(self.path)) is not None:
@@ -817,6 +879,36 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(409, {"error": str(exc)})
         else:
             self._send_json(201 if created else 200, reservation)
+
+    def _handle_cancel_reservation(self):
+        """POST /reservations/cancel → 200 被取消的那条预约 / 404 不成立 (#49/TC1)。
+
+        请求体是 JSON 对象，字段 reservation_id 与 holder；无路径参数，不读查询串。
+        被拒响应恒为 404 + code=reservation_not_found + error，两种不成立同一形状。
+        """
+        payload = self._read_json()
+        if payload is None:
+            return
+        reservation_id = payload.get("reservation_id")
+        holder = payload.get("holder")
+        if not isinstance(reservation_id, str) or not reservation_id:
+            self._send_json(
+                400,
+                {"error": "reservation_id must be a non-empty string"},
+            )
+            return
+        if not isinstance(holder, str) or not holder:
+            self._send_json(400, {"error": "holder must be a non-empty string"})
+            return
+        try:
+            reservation = cancel_reservation(reservation_id, holder)
+        except ReservationNotFound as exc:
+            self._send_json(
+                404,
+                {"error": str(exc), "code": RESERVATION_NOT_FOUND},
+            )
+        else:
+            self._send_json(200, reservation)
 
     def _handle_list_reservations(self, book_id: str):
         """GET /books/<id>/reservations → 200 等待预约数组 (TC5)。"""
