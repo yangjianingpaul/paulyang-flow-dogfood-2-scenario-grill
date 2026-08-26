@@ -1,6 +1,11 @@
 # paulyang-flow-dogfood-2-scenario-grill
 Dogfood for paulyang-flow scenario-first grilling
 
+**这个产品当前能做什么 → [SCENARIOS.md](SCENARIOS.md)**
+机械生成，每轮 closeout 重算；人类维护的是它，不是代码。
+
+---
+
 ## 实现 Session 冷启动入口
 
 1. 在本仓库主 clone 的干净默认分支上运行 `/implement`。
