@@ -691,6 +691,53 @@ def cancel_reservation(reservation_id: str, holder: str) -> dict:
     }
 
 
+def remove_reservation(reservation_id: str) -> dict:
+    """馆员把任意一位等待者移出队列：把那一行从等待集合中删除 (#53/DEC1, TC7)。
+
+    成立的条件恰有一个：该 reservation_id 当前存在于 reservations 表中。请求不带
+    holder，本函数也不接受、不读取、不校验任何 holder —— 号是谁的就移谁 (#53/DEC1)。
+    定位与删除在同一个事务内完成，定位不到就 rollback 抛出与读者本人取消逐字同一种
+    拒绝，因而移出不幂等：同一个标识的第二次移出走被拒分支 (#53/DEC3, TC3)。
+
+    移出只整理队列 (#53/DEC4, TC5)：同一事务只触碰 reservations 一张表，不写
+    books.available_stock、不写 books.solo_defer_release、不写 loans，被拒的移出在
+    rollback 之后三张表一行都不改变。它也不改写其余等待者的 queue_order —— position
+    的连续收敛由 list_reservations 的既有列表口径给出 (TC8)；被删除的 public_id 由
+    既有 AUTOINCREMENT 派生，因而永不被复用 (TC4)。
+    """
+    with closing(_connect_inventory()) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT sequence, book_id, holder
+                FROM reservations
+                WHERE public_id = ?
+                """,
+                (reservation_id,),
+            ).fetchone()
+            if row is None:
+                raise ReservationNotFound(
+                    "no waiting reservation matches this reservation id"
+                )
+            sequence, book_id, holder = row
+
+            connection.execute(
+                "DELETE FROM reservations WHERE sequence = ?",
+                (sequence,),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "id": reservation_id,
+        "book_id": book_id,
+        "holder": holder,
+    }
+
+
 def _now_iso8601_utc() -> str:
     """UTC ISO-8601，以 Z 结尾 (TC20)。"""
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -709,6 +756,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_create_reservation()
         elif self.path == "/reservations/cancel":
             self._handle_cancel_reservation()
+        elif self.path == "/reservations/remove":
+            self._handle_remove_reservation()
         elif (book_id := self._match_fulfill_path(self.path)) is not None:
             self._handle_fulfill_reservation(book_id)
         elif (book_id := self._match_defer_path(self.path)) is not None:
@@ -902,6 +951,35 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             reservation = cancel_reservation(reservation_id, holder)
+        except ReservationNotFound as exc:
+            self._send_json(
+                404,
+                {"error": str(exc), "code": RESERVATION_NOT_FOUND},
+            )
+        else:
+            self._send_json(200, reservation)
+
+    def _handle_remove_reservation(self):
+        """POST /reservations/remove → 200 被移出的那条预约 / 404 不成立 (TC1)。
+
+        请求体是 JSON 对象，唯一字段 reservation_id；请求不含 holder，本入口也不
+        读取、不校验任何 holder (#53/DEC1)。无路径参数，不读查询串。成功响应恰为
+        被移出的那一条 {id, book_id, holder}，不含任何 Loan 字段；被拒响应恒为
+        404 + code=reservation_not_found + 非空 error，与既有取消入口逐字同形状，
+        四种当前不存在对调用方不可区分 (#53/DEC3, TC3)。
+        """
+        payload = self._read_json()
+        if payload is None:
+            return
+        reservation_id = payload.get("reservation_id")
+        if not isinstance(reservation_id, str) or not reservation_id:
+            self._send_json(
+                400,
+                {"error": "reservation_id must be a non-empty string"},
+            )
+            return
+        try:
+            reservation = remove_reservation(reservation_id)
         except ReservationNotFound as exc:
             self._send_json(
                 404,
