@@ -8,13 +8,17 @@ import json
 import socket
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
 PORT = 8000
 INVENTORY_DB_PATH = Path(__file__).resolve().parent / ".runtime" / "inventory.sqlite3"
+
+# 建书未给 reservation_ttl_seconds 时写入的内置默认值 (TC12)。
+# 它足够长，#61 的重放全程不会到期；秒数本身是技术约定，不进任何硬断言。
+DEFAULT_RESERVATION_TTL_SECONDS = 86400
 
 # 等待集合中的每一条预约都处于该状态；兑现即移出集合 (TC2, TC6)。
 WAITING = "waiting"
@@ -100,7 +104,10 @@ def _connect_inventory() -> sqlite3.Connection:
             -- 它是属于该 SKU 的状态量，不属于任何一条预约，因此存在 books 上；
             -- 取值是被处置的那条等待预约的 public_id，NULL 表示当前没有放行。
             -- 记住是谁被处置，才能让放行只对那个人所在的单人队列生效 (#42/TC3, #42/TC6)。
-            solo_defer_release TEXT
+            solo_defer_release TEXT,
+            -- 该 SKU 全部等待预约共用的有效期，单位秒 (TC2, TC3)。
+            -- 有效期属于 SKU 而不属于任何一条预约，登记之后不随任何一条预约改变。
+            reservation_ttl_seconds INTEGER NOT NULL
         )
         """
     )
@@ -126,6 +133,9 @@ def _connect_inventory() -> sqlite3.Connection:
             -- 该 SKU 内的队列序，从 1 起连续；登记时追加至队尾，处置时被改写，
             -- 因此它与单调自增的 sequence 分开 (#42/TC5)。
             queue_order INTEGER NOT NULL,
+            -- 这条预约自己的到期时刻，登记时按「登记时刻 + 该 SKU 的有效期」写死 (TC4)。
+            -- 每条预约各自独立计时，与队列位置无关，写入之后不再被任何动作改写。
+            expires_at TEXT,
             UNIQUE (book_id, holder),
             FOREIGN KEY (book_id) REFERENCES books(public_id)
         )
@@ -134,13 +144,27 @@ def _connect_inventory() -> sqlite3.Connection:
     return connection
 
 
-def create_book(title: str, initial_stock: int) -> dict:
-    """原子创建 SKU，并把初始库存写入共享 SQLite。"""
+def create_book(
+    title: str,
+    initial_stock: int,
+    reservation_ttl_seconds: int | None = None,
+) -> dict:
+    """原子创建 SKU，并把初始库存与预约有效期写入共享 SQLite (TC3)。
+
+    未给 reservation_ttl_seconds 时落到 TC12 的内置默认值，建书照常成功；
+    有效期属于这个 SKU，登记之后不随任何一条预约改变。
+    响应形状不变：本轮不向任何响应新增字段 (TC1)。
+    """
+    if reservation_ttl_seconds is None:
+        reservation_ttl_seconds = DEFAULT_RESERVATION_TTL_SECONDS
     with closing(_connect_inventory()) as connection:
         with connection:
             cursor = connection.execute(
-                "INSERT INTO books (title, available_stock) VALUES (?, ?)",
-                (title, initial_stock),
+                """
+                INSERT INTO books (title, available_stock, reservation_ttl_seconds)
+                VALUES (?, ?, ?)
+                """,
+                (title, initial_stock, reservation_ttl_seconds),
             )
             public_id = f"bk_{cursor.lastrowid}"
             connection.execute(
@@ -379,12 +403,16 @@ def create_reservation(book_id: str, holder: str) -> tuple[dict, bool]:
         try:
             connection.execute("BEGIN IMMEDIATE")
             book = connection.execute(
-                "SELECT available_stock FROM books WHERE public_id = ?",
+                """
+                SELECT available_stock, reservation_ttl_seconds
+                FROM books
+                WHERE public_id = ?
+                """,
                 (book_id,),
             ).fetchone()
             if book is None:
                 raise NotFound(f"no book with id {book_id!r}")
-            (available_stock,) = book
+            available_stock, reservation_ttl_seconds = book
 
             existing = connection.execute(
                 """
@@ -411,9 +439,12 @@ def create_reservation(book_id: str, holder: str) -> tuple[dict, bool]:
                         "stock available: borrow this book directly "
                         "instead of reserving it"
                     )
+                # 这条预约的到期时刻在登记这一刻定死 (TC4)：每条各自独立计时，
+                # 与它在队列中的位置无关，写入之后不再被任何动作改写。
                 cursor = connection.execute(
                     """
-                    INSERT INTO reservations (book_id, holder, queue_order)
+                    INSERT INTO reservations
+                        (book_id, holder, queue_order, expires_at)
                     VALUES (
                         ?,
                         ?,
@@ -421,10 +452,16 @@ def create_reservation(book_id: str, holder: str) -> tuple[dict, bool]:
                             SELECT COALESCE(MAX(queue_order), 0) + 1
                             FROM reservations
                             WHERE book_id = ?
-                        )
+                        ),
+                        ?
                     )
                     """,
-                    (book_id, holder, book_id),
+                    (
+                        book_id,
+                        holder,
+                        book_id,
+                        _expires_at_iso8601_utc(reservation_ttl_seconds),
+                    ),
                 )
                 sequence = cursor.lastrowid
                 public_id = f"rs_{sequence}"
@@ -491,6 +528,37 @@ def list_reservations(book_id: str) -> list[dict]:
     ]
 
 
+def _purge_expired_head_reservations(
+    connection: sqlite3.Connection, book_id: str
+) -> list[str]:
+    """删除该 SKU 队首起连续的一段已过期预约，返回被删掉的 public_id (TC7)。
+
+    遇到第一个未过期者即停，其余等待者一行不动。判定口径是
+    `expires_at <= 服务端当前时刻`，因此没有到期时刻的行不算已过期。
+    调用者必须已经开启事务：清理与随后的发书同属一个事务 (TC6, TC8)。
+    """
+    now = _now_iso8601_utc()
+    rows = connection.execute(
+        """
+        SELECT sequence, public_id, expires_at
+        FROM reservations
+        WHERE book_id = ?
+        ORDER BY queue_order
+        """,
+        (book_id,),
+    ).fetchall()
+    purged = []
+    for sequence, public_id, expires_at in rows:
+        if expires_at is None or expires_at > now:
+            break
+        connection.execute(
+            "DELETE FROM reservations WHERE sequence = ?",
+            (sequence,),
+        )
+        purged.append(public_id)
+    return purged
+
+
 def fulfill_head_reservation(book_id: str) -> dict:
     """兑现当前队首：一个原子事务内扣库存、移出等待集合并创建 Loan (TC3, TC4)。
 
@@ -507,6 +575,12 @@ def fulfill_head_reservation(book_id: str) -> dict:
             if book is None:
                 raise NotFound(f"no book with id {book_id!r}")
             (available_stock,) = book
+
+            # 先清掉队首侧已过期的预约，再看谁是队首 (TC7, TC8)：清理与随后的
+            # 扣库存、建 Loan 同属这一个事务，因此不存在「预约已被清掉但书没有
+            # 发出去」的中间状态 (TC6)。清理之后队列为空时，兑现按既有的
+            # 「没有等待者」被拒；已过期的预约从不产生 Loan。
+            _purge_expired_head_reservations(connection, book_id)
 
             head = connection.execute(
                 """
@@ -744,6 +818,17 @@ def _now_iso8601_utc() -> str:
     return now.isoformat().replace("+00:00", "Z")
 
 
+def _expires_at_iso8601_utc(ttl_seconds: int) -> str:
+    """登记时刻 + 该 SKU 的有效期，与当前时刻同一口径 (TC4, TC11)。
+
+    时间来源仍是 _now_iso8601_utc，因此两者是等长的定长文本，
+    到期判定可以直接按文本比较，不需要第二种时间口径。
+    """
+    registered_at = datetime.fromisoformat(_now_iso8601_utc().replace("Z", "+00:00"))
+    expires_at = registered_at + timedelta(seconds=ttl_seconds)
+    return expires_at.isoformat().replace("+00:00", "Z")
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -874,7 +959,25 @@ class Handler(BaseHTTPRequestHandler):
                 {"error": "initial_stock must be a non-negative integer"},
             )
             return
-        self._send_json(201, create_book(title, initial_stock))
+        # 可选的预约有效期 (TC1)：不给时按 TC12 落到内置默认值，建书照常成功；
+        # 出现但不是正整数时 400，校验口径与 initial_stock / quantity 一致。
+        reservation_ttl_seconds = None
+        if "reservation_ttl_seconds" in payload:
+            reservation_ttl_seconds = payload["reservation_ttl_seconds"]
+            if (
+                not isinstance(reservation_ttl_seconds, int)
+                or isinstance(reservation_ttl_seconds, bool)
+                or reservation_ttl_seconds <= 0
+            ):
+                self._send_json(
+                    400,
+                    {"error": "reservation_ttl_seconds must be a positive integer"},
+                )
+                return
+        self._send_json(
+            201,
+            create_book(title, initial_stock, reservation_ttl_seconds),
+        )
 
     def _handle_create_loan(self):
         """POST /loans → 201 Loan / 404 未知 book / 409 有等待队列 / 409 库存耗尽。"""
