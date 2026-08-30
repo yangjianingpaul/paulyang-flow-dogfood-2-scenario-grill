@@ -266,10 +266,20 @@ def create_loan(book_id: str, borrower: str) -> dict:
     规则拒绝，转由既有库存判定继续，借阅成功即消耗这次放行。放行从未产生、已被
     消耗、处置时队列还有其他等待者、以及队首本人走普通借阅这四种状态下，上面那条
     规则原样无条件成立 —— 队首要拿到这一本，仍然只能经由馆员兑现。
+
+    普通借阅同样一次到位 (DEC5, TC9)：队列判定之前先按 TC7 清掉队首侧已过期的
+    预约，清理之后队列为空且有可用库存时当场创建 Loan，读者不需要借第二次。
     """
     with closing(_connect_inventory()) as connection:
         try:
             connection.execute("BEGIN IMMEDIATE")
+            # 先清理，再队列判定，最后库存判定 (TC9)。清理与随后的扣库存、建 Loan
+            # 同属这一个事务：任一分支回滚时清理一并回滚，因此任何时刻都不存在
+            # 「预约已被清掉但书没有发出去」的中间状态；同一 SKU 上两个并发的
+            # 普通借阅被这把 BEGIN IMMEDIATE 串行化，架上只有一本时恰好一个成功
+            # (TC6)。清理规则只有 _purge_expired_head_reservations 一份 (TC7)。
+            _purge_expired_head_reservations(connection, book_id)
+
             queue = connection.execute(
                 """
                 SELECT public_id, holder
